@@ -5,10 +5,11 @@ import torch
 import numpy as np
 import torch.distributions as tdist
 import scipy.io
+import itertools
 
 
 class NbrReg(torch.nn.Module):
-    def __init__(self, lex_size, bit_size, h_size=1000):
+    def __init__(self, lex_size, bit_size=32, h_size=1000):
         super(NbrReg, self).__init__()
         self.lnr_h1 = torch.nn.Linear(lex_size, h_size)
         self.lnr_h2 = torch.nn.Linear(h_size, h_size)
@@ -25,15 +26,16 @@ class NbrReg(torch.nn.Module):
 
     def encode(self, docs):
         relu = torch.nn.ReLU()
-        # sigmoid = torch.nn.Sigmoid()
+        sigmoid = torch.nn.Sigmoid()
         hidden = relu(self.lnr_h2(relu(self.lnr_h1(docs))))
         mu = self.lnr_mu(hidden)
-        sigma = self.lnr_sigma(hidden)
+        # Use sigmoid for positive standard deviation
+        sigma = sigmoid(self.lnr_sigma(hidden))
         return mu, sigma
 
     def decode(self, latent):
         # Listening to the advice on the torch.nn.Softmax; we use
-        # LogSoftmax since we'll use NLLLose. Rather than
+        # LogSoftmax since we'll use NLLLoss. Rather than
         # multiplication of each word prob and then taking log, we
         # compute log and then sum the probabilities.
         log_softmax = torch.nn.LogSoftmax(dim=1)
@@ -114,16 +116,21 @@ def test(train_docs, train_cats, test_docs, test_cats, model, bsize=100,
         return prec_sum / test_hash.shape[0]
 
 
-def train(train_docs, train_cats, train_knn, cv_docs, cv_cats, bitsize,
-          epoch=30, bsize=100, lr=1e-3, latent_size=1000):
+def train(train_docs, train_cats, train_knn, cv_docs, cv_cats, bitsize=32,
+          epoch=30, bsize=100, lr=1e-3, latent_size=1000, resume=None,
+          imp_trial=0):
     nsize, lexsize = train_docs.shape
-    num_iter = nsize // bsize
-    model = NbrReg(lexsize, bitsize, h_size=latent_size)
+    num_iter = int(np.ceil(nsize / bsize))
+    model = resume if resume else NbrReg(lexsize, bitsize, h_size=latent_size)
     model.double()
     optim = torch.optim.Adam(model.parameters(), lr=lr)
     norm = tdist.Normal(0, 1)
     best_prec = 0.0
-    for e in range(epoch):
+    trial = 0
+    epoch_range = itertools.count() if imp_trial else epoch
+    epoch = "INF" if imp_trial else epoch
+
+    for e in epoch_range:
         model.train()
         losses = []
         for i in range(num_iter):
@@ -148,69 +155,78 @@ def train(train_docs, train_cats, train_knn, cv_docs, cv_cats, bitsize,
         avg_prec = test(train_docs, train_cats, cv_docs, cv_cats, model)
         best_prec = max(avg_prec, best_prec)
         print(f"Epoch {e + 1}: Avg Loss: {avg_loss}, Avg Prec: {avg_prec}")
+        if best_prec == avg_prec:
+            trial = 0
+        else:
+            trial += 1
+            if trial == imp_trial:
+                print(f"Avg Prec could not be improved for {imp_trial} times, "
+                      "giving up training")
+                break
+
     return model, best_prec
 
 
-def get_train_knn(fname, k=20):
-    knn = None
-    with open(fname) as fs:
-        lines = fs.readlines()
-
-    for l in lines:
-        _, nns_str = l.rstrip().split(":", maxsplit=1)
-        nns = [int(n) for n in nns_str.split(",")]
-        nns = torch.tensor(nns[1:k + 1]).reshape(1, k)
-        if knn is None:
-            knn = nns
-        else:
-            knn = torch.cat((knn, nns))
-
-    return knn
+def load_model(mpath, lexsize, bit_size, h_size):
+    model = NbrReg(lexsize, bit_size=bit_size, h_size=h_size)
+    model.double()
+    model.load_state_dict(torch.load(mpath))
+    return model
 
 
 def main():
     parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(
+        help="Subcommand help", dest="task")
+    train_parser = subparsers.add_parser("train",
+                                         help="Train a model and save")
+    subparsers.add_parser("test", help="Load and test a model")
+
     parser.add_argument("data", help="Input data")
-    parser.add_argument("knn", help="Train knn data")
-    parser.add_argument("--train", type=str, help="File to save trained model")
-    parser.add_argument("--epoch", default=30, type=int)
-    parser.add_argument("--test", type=str, help="Trained model")
+    parser.add_argument("model", help="Path to model")
+    parser.add_argument("-b", "--bit-size", type=int, default=32)
+    parser.add_argument("-t", "--latent-size", type=int, default=1000)
+
+    train_parser.add_argument("-e", "--epoch", type=int, default=15)
+    train_parser.add_argument("-a", "--batch-size", type=int, default=100)
+    train_parser.add_argument("-l", "--learning-rate", type=float,
+                              default=1e-3)
+    train_parser.add_argument("-k", "--knn-size", type=int, default=20)
+    train_parser.add_argument("-r", "--resume",
+                              help="Resume training the given model")
+    train_parser.add_argument("-i", "--trial", type=int, default=0,
+                              help="Give up training if no improvements "
+                              "have been observed for given number of epochs")
+
     args = parser.parse_args()
-    # data = np.load(args.data, allow_pickle=True)
-    # docs = data["docs"].item()
-    # categories = data["categories"]
-
-    # nsize = docs.shape[0]
-    # train_size = nsize // 10 * 8
-    # cv_size = (nsize - train_size) // 2
-    # test_size = nsize - train_size - cv_size
-
-    # train_docs = docs[:train_size]
-    # train_cats = categories[:train_size]
-    # cv_start = train_size + cv_size
-    # cv_docs = docs[train_size:cv_start]
-    # cv_cats = categories[train_size:cv_start]
-    # test_docs = docs[cv_start:cv_start + test_size]
-    # test_cats = categories[cv_start:cv_start + test_size]
 
     data = scipy.io.loadmat(args.data)
     train_docs = data["train"]
     train_cats = data["gnd_train"]
-    test_docs = data["test"]
-    test_cats = data["gnd_test"]
-    cv_docs = data["cv"]
-    cv_cats = data["gnd_cv"]
-    train_knn = get_train_knn(args.knn)
-    if args.test:
-        model = NbrReg(train_docs.shape[1], 32)
-        model.double()
-        model.load_state_dict(torch.load(args.test))
-        avg_prec = test(train_docs, train_cats, test_docs, test_cats, model)
-        print(f"Avg precision: {avg_prec}")
+    if args.task == "train":
+        cv_docs = data["cv"]
+        cv_cats = data["gnd_cv"]
+        train_knn = data["train_knn"]
+        if args.resume:
+            res_m = load_model(args.resume, train_docs.shape[1], args.bit_size,
+                               args.latent_size)
+        else:
+            res_m = None
+
+        model, best_cv_prec = train(train_docs, train_cats,
+                                    train_knn[:, :args.knn_size], cv_docs,
+                                    cv_cats, bitsize=args.bit_size,
+                                    epoch=args.epoch, lr=args.learning_rate,
+                                    latent_size=args.latent_size, resume=res_m,
+                                    imp_trial=args.trial)
+        torch.save(model.state_dict(), args.model)
     else:
-        model, best_prec = train(train_docs, train_cats, train_knn, cv_docs,
-                                 cv_cats, 32, epoch=args.epoch)
-        torch.save(model.state_dict(), args.train)
+        test_docs = data["test"]
+        test_cats = data["gnd_test"]
+        model = load_model(args.model, train_docs.shape[1], args.bit_size,
+                           args.latent_size)
+        avg_prec = test(train_docs, train_cats, test_docs, test_cats, model)
+        print(f"Average test precision: {avg_prec}")
     return 0
 
 
